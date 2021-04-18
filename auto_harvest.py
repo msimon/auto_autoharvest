@@ -22,20 +22,23 @@ PANCAKE_PRICE_URL = "https://api.pancakeswap.com/api/v1/price"
 PANCAKE_ASSUMED_SLIPPAGE = Decimal(0.5 / 100)
 AUTO_WBNB_POOL_ID = 6
 
-
 def decode_hex(contract, hex):
     function_def, params = contract.decode_function_input(hex)
     print(function_def)
     print(params)
 
+def deduct_slippage(amount):
+    return int(amount * (1 - PANCAKE_ASSUMED_SLIPPAGE))
+
 ### Main function
-def auto_compund(wallet_address, private_key, min_amount_to_harvest):
+def auto_compound(wallet_address, private_key, min_amount_to_harvest, compound_strategy):
     w3 = Web3(Web3.HTTPProvider('https://bsc-dataseed1.binance.org:443'))
     auto_contract = w3.eth.contract(address=AUTO_CONTRACT, abi=AUTO_ABI)
     pancake_swap_contract = w3.eth.contract(address=PANCAKE_SWAP_CONTRACT, abi=PANCAKE_SWAP_ABI)
 
     auto_farms_data = requests.get(AUTO_FARM_INFO_URL).json()
-    auto_pool_ids = _.get(auto_farms_data, 'pools', {}).keys()
+    # Inject key (id) in pool dict
+    auto_pools = [{**o, **{'pool_id': int(k)}} for (k, o) in _.get(auto_farms_data, 'pools', {}).items()] 
 
     def get_auto_wbnb_price():
         pancake_swap_price = requests.get(PANCAKE_PRICE_URL).json()
@@ -45,107 +48,143 @@ def auto_compund(wallet_address, private_key, min_amount_to_harvest):
 
     auto_price_usd, wbnb_price_usd = get_auto_wbnb_price()
 
-    if not auto_pool_ids or not auto_price_usd or not wbnb_price_usd:
+    if not auto_pools or not auto_price_usd or not wbnb_price_usd:
         print("Missing pool and/or price data. Exiting...")
         exit()
+ 
+    def contract(address):
+        abi = requests.get(f"https://api.bscscan.com/api?module=contract&action=getabi&address={address}").json()['result']
+        return w3.eth.contract(address=address, abi=abi)
 
-    def withdraw_auto_token_if_necessary(acc_auto_withdraw_gwei, pool_id):
-        pool_id = int(pool_id)
-        current_pending_auto_gwei = auto_contract.functions.pendingAUTO(pool_id, wallet_address).call()
+    def transaction(contractFunc):
+        tx = contractFunc.buildTransaction({
+            'from': wallet_address,
+            'nonce': w3.eth.getTransactionCount(wallet_address),
+            'gas': 500000
+        })
+        signed_tx = w3.eth.account.signTransaction(tx, private_key)
+        tx_hash = w3.eth.sendRawTransaction(signed_tx.rawTransaction)
+        tx_receipt = w3.eth.waitForTransactionReceipt(tx_hash)
+        return tx_receipt
+
+    def deposit(pool, amount):
+        tx_receipt = transaction(auto_contract.functions.deposit(pool.pool_id, amount))
+        print(f"...end.\n tx hash = {tx_receipt['transactionHash'].hex()}")
+
+    def withdraw_auto_token_if_necessary(pool):
+        current_pending_auto_gwei = auto_contract.functions.pendingAUTO(pool.pool_id, wallet_address).call()
         current_pending_auto_eth = w3.fromWei(current_pending_auto_gwei, 'ether')
 
         if current_pending_auto_eth * auto_price_usd > min_amount_to_harvest:
             print("\n")
-            print(f"- Current pending auto for pool id {pool_id}: {current_pending_auto_eth} = ${current_pending_auto_eth * auto_price_usd:.2f}. Withdrawing...")
+            print(f"- Current pending auto for pool id {pool.pool_id}: {current_pending_auto_eth} = ${current_pending_auto_eth * auto_price_usd:.2f}. Withdrawing...")
             # withdrawing a pool with 0 only withdraw the reward = Harvest
-            tx = auto_contract.functions.withdraw(pool_id, 0).buildTransaction({
-                'from': wallet_address,
-                'nonce': w3.eth.getTransactionCount(wallet_address),
-                'gas': 500000
-            })
-            signed_tx = w3.eth.account.signTransaction(tx, private_key)
-            tx_hash = w3.eth.sendRawTransaction(signed_tx.rawTransaction)
-            tx_receipt = w3.eth.waitForTransactionReceipt(tx_hash)
+            tx_receipt = transaction(auto_contract.functions.withdraw(pool.pool_id, 0))
             print(f"...done.\n tx hash = {tx_receipt['transactionHash'].hex()}")
-            return acc_auto_withdraw_gwei + current_pending_auto_gwei
-        return acc_auto_withdraw_gwei
+            return current_pending_auto_gwei
+        return 0
 
+    def swap_auto_for_token(amount, token_contract):
+        # Can't swap auto for auto lol
+        if token_contract.address == AUTO_TOKEN_CONTRACT:
+            return amount
+
+        # If requested token is other than WBNB, then route throught WBNB (ex: AUTO -> WBNB -> USDC)
+        # If requested token is WBNB, then wire directly (ex: AUTO -> WBNB)
+        # TODO: find a way to get optimal path (contract/api/manual?)
+        path = [AUTO_TOKEN_CONTRACT] + _.uniq([WRAP_BNB_TOKEN_CONTRACT, token_contract.address]) 
+        symbol = token_contract.functions.symbol().call()
+        amounts_out = pancake_swap_contract.functions.getAmountsOut(
+            amountIn=amount,
+            path=path,
+        ).call()
+
+        amount_min = deduct_slippage(_.last(amounts_out))
+        
+        print(f"- Swapping AUTO {amount} for {amount_min} {symbol} on pancakeswap...", end='')
+
+        tx_receipt = transaction(
+            pancake_swap_contract.functions.swapExactTokensForTokens(
+                amountIn=amount,
+                amountOutMin=amount_min,
+                path=path,
+                to=wallet_address,
+                deadline=int(time()) + 60 * 5 # give 5 minutes deadline
+            )
+        )
+        print(f"...done.\n tx hash = {tx_receipt['transactionHash'].hex()}")
+
+        # TODO: Ask bro: isn't the slippage already deducted from result ? (logs[2].data)
+        received_amt_gwei = int(_.get(tx_receipt, 'logs[2].data'), 16)
+        return deduct_slippage(received_amt_gwei)
+
+    def add_liquidity(token0_contract, amount0, token1_contract, amount1):
+        tx_receipt = transaction(
+            pancake_swap_contract.functions.addLiquidity(
+                tokenA=token0_contract.address,
+                tokenB=token1_contract.address,
+                amountADesired=amount0,
+                amountBDesired=amount1,
+                amountAMin=0,
+                amountBMin=0,
+                to=wallet_address,
+                deadline=int(time()) + 60 * 5 # give 5 minutes deadline
+            )
+        )
+        print(f"...done.\n tx hash = {tx_receipt['transactionHash'].hex()}")
+
+        liquidity_created = int(_.get(tx_receipt, 'logs[4].data'), 16)
+        return liquidity_created
+
+    def auto_compound_same_pool(pool):
+        harvested_auto_amt_gwei = withdraw_auto_token_if_necessary(pool)
+
+        if harvested_auto_amt_gwei > 0:
+            pool_contract = contract(_.get(pool, 'poolInfo.want'))
+
+            # @TODO: Ask bro: Is there a better way to know if the contract is a pair or an actual token ?
+            # https://pancakeswap.info/pairs
+            # https://pancakeswap.info/tokens
+            is_pair = len(_.map(['token0', 'token1'], lambda f: pool_contract.find_functions_by_name(f))) == 2
+
+            if is_pair:
+                half_harvested_auto_amt_gwei = int(harvested_auto_amt_gwei / 2)
+                token0_contract = contract(pool_contract.functions.token0().call())
+                token1_contract = contract(pool_contract.functions.token1().call())
+                token0_amount = swap_auto_for_token(half_harvested_auto_amt_gwei, token0_contract)
+                token1_amount = swap_auto_for_token(half_harvested_auto_amt_gwei, token1_contract)
+                token = add_liquidity(token0_contract, token0_amount, token1_contract, token1_amount)
+                deposit(pool, token)
+            else:
+                token = swap_auto_for_token(harvested_auto_amt_gwei, pool_contract)
+                deposit(pool, token)
 
     connected = w3.isConnected()
 
     if connected:
-        print(f"Checking each pool to see if auto rewards meet the ${min_amount_to_harvest} threshold")
-        harvested_auto_amt_gwei = _.reduce(auto_pool_ids, withdraw_auto_token_if_necessary, 0)
-        harvested_auto_amt_eth = w3.fromWei(harvested_auto_amt_gwei, 'ether')
-        print(f"- Total harvested: Auto {harvested_auto_amt_eth} = ${harvested_auto_amt_eth * auto_price_usd:.2f}")
-        if harvested_auto_amt_gwei > 0:
-            ## SELL HALF AUTO FOR WBNB
+        print(f"Using strategy: {compound_strategy}")
+        if compound_strategy == "same-pool":
+            # @TODO: Should we filter pools to get the ones were stacked > 0 only ?
+            _.for_each(auto_pools, auto_compound_same_pool)
+        elif compound_strategy == "auto-wbnb-lp":
+            auto_wbnb_pool = _.find(auto_pools, lambda pool: pool.pool_id == AUTO_WBNB_POOL_ID)
+            
+            if not auto_wbnb_pool:
+                print("Missing AUTO/WBNB Pool. Exiting...")
+                exit(-1)
 
-            half_harvested_auto_amt_gwei = int(harvested_auto_amt_gwei / 2)
-            # get expceted WBNB amount from pancake
-            amounts_out = pancake_swap_contract.functions.getAmountsOut(
-                amountIn=half_harvested_auto_amt_gwei,
-                path=[AUTO_TOKEN_CONTRACT, WRAP_BNB_TOKEN_CONTRACT],
-            ).call()
-
-            wbnb_amt_gwei = int(amounts_out[1] * (1 - PANCAKE_ASSUMED_SLIPPAGE))
-
-            print(f"- Swapping AUTO {half_harvested_auto_amt_gwei} for WBNB {wbnb_amt_gwei} on pancakeswap...", end='')
-            tx = pancake_swap_contract.functions.swapExactTokensForTokens(
-                    amountIn=half_harvested_auto_amt_gwei,
-                    amountOutMin=wbnb_amt_gwei,
-                    path=[AUTO_TOKEN_CONTRACT, WRAP_BNB_TOKEN_CONTRACT],
-                    to=wallet_address,
-                    deadline=int(time()) + 60 * 5 # give 5 minutes deadline
-                ).buildTransaction({
-                    'from': wallet_address,
-                    'nonce': w3.eth.getTransactionCount(wallet_address),
-                    'gas': 500000
-                }
-            )
-            signed_tx = w3.eth.account.signTransaction(tx, private_key)
-            tx_hash = w3.eth.sendRawTransaction(signed_tx.rawTransaction)
-            tx_receipt = w3.eth.waitForTransactionReceipt(tx_hash)
-            print(f"...done.\n tx hash = {tx_receipt['transactionHash'].hex()}")
-
-            ## ADD LIQUIDITY TO PANCAKE SWAP. SWAP AUTO & WBNB FOR WBNB-AUTO LP TOKEN
-            received_wbnb_amt_gwei = int(_.get(tx_receipt, 'logs[2].data'), 16)
-
-            wbnb_amt_gwei = int(received_wbnb_amt_gwei * (1 - PANCAKE_ASSUMED_SLIPPAGE))
-            print(f"- Add lidquidity AUTO-WBNB: AUTO {half_harvested_auto_amt_gwei} for WBNB {wbnb_amt_gwei} on pancakeswap...", end='')
-            tx = pancake_swap_contract.functions.addLiquidity(
-                    tokenA=AUTO_TOKEN_CONTRACT,
-                    tokenB=WRAP_BNB_TOKEN_CONTRACT,
-                    amountADesired=half_harvested_auto_amt_gwei,
-                    amountBDesired=wbnb_amt_gwei,
-                    amountAMin=0,
-                    amountBMin=0,
-                    to=wallet_address,
-                    deadline=int(time()) + 60 * 5 # give 5 minutes deadline
-                ).buildTransaction({
-                    'from': wallet_address,
-                    'nonce': w3.eth.getTransactionCount(wallet_address),
-                    'gas': 500000
-                }
-            )
-            signed_tx = w3.eth.account.signTransaction(tx, private_key)
-            tx_hash = w3.eth.sendRawTransaction(signed_tx.rawTransaction)
-            tx_receipt = w3.eth.waitForTransactionReceipt(tx_hash)
-            print(f"...done.\n tx hash = {tx_receipt['transactionHash'].hex()}")
-
-            ## DEPOSITE LP TOKEN TO AUTOFARM WBNB-AUTO POOL
-            liquidity_created = int(_.get(tx_receipt, 'logs[4].data'), 16)
-
-            print(f"- Add {w3.fromWei(liquidity_created, 'ether')} token back into AUTO-WBNB LP vault...", end='')
-            tx = auto_contract.functions.deposit(AUTO_WBNB_POOL_ID, liquidity_created).buildTransaction({
-                'from': wallet_address,
-                'nonce': w3.eth.getTransactionCount(wallet_address),
-                'gas': 500000
-            })
-            signed_tx = w3.eth.account.signTransaction(tx, private_key)
-            tx_hash = w3.eth.sendRawTransaction(signed_tx.rawTransaction)
-            tx_receipt = w3.eth.waitForTransactionReceipt(tx_hash)
-            print(f"...end.\n tx hash = {tx_receipt['transactionHash'].hex()}")
+            print(f"Checking each pool to see if auto rewards meet the ${min_amount_to_harvest} threshold")
+            # @TODO: Should we filter pools to get the ones were stacked > 0 only ?
+            harvested_auto_amt_gwei = _.reduce(auto_pools, lambda acc, pool: acc + withdraw_auto_token_if_necessary(pool), 0)
+            harvested_auto_amt_eth = w3.fromWei(harvested_auto_amt_gwei, 'ether')
+            print(f"- Total harvested: Auto {harvested_auto_amt_eth} = ${harvested_auto_amt_eth * auto_price_usd:.2f}")
+            if harvested_auto_amt_gwei > 0:
+                half_harvested_auto_amt_gwei = int(harvested_auto_amt_gwei / 2)
+                auto_token_contract = contract(AUTO_TOKEN_CONTRACT)
+                wbnb_token_contract = contract(WRAP_BNB_TOKEN_CONTRACT)
+                wbnb_amt_gwei = swap_auto_for_token(half_harvested_auto_amt_gwei, wbnb_token_contract)
+                liquidity_created = add_liquidity(auto_token_contract, half_harvested_auto_amt_gwei, wbnb_token_contract, wbnb_amt_gwei)
+                deposit(auto_wbnb_pool, liquidity_created)
     else:
         print("Connection Error!")
 
@@ -155,6 +194,7 @@ if __name__ == '__main__':
     parser.add_argument('--wallet_address', action='store', required=True)
     parser.add_argument('--private_key', action='store', required=True)
     parser.add_argument('--min_amount_to_harvest', action='store', type=float, required=True)
+    parser.add_argument('--compound_strategy', action='store', required=True, choices=['auto-wbnb-lp', 'same-pool'])
 
     args = parser.parse_args(sys.argv[1:])
 
@@ -162,10 +202,11 @@ if __name__ == '__main__':
     print(f"Ran at {datetime.now()}")
     print('==================================')
 
-    auto_compund(
+    auto_compound(
         args.wallet_address,
         args.private_key,
-        args.min_amount_to_harvest
+        args.min_amount_to_harvest,
+        args.compound_strategy
     )
 
     print("\n")
