@@ -20,7 +20,7 @@ AUTO_TOKEN_CONTRACT = "0xa184088a740c695E156F91f5cC086a06bb78b827"
 WRAP_BNB_TOKEN_CONTRACT = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"
 
 AUTO_FARM_INFO_URL = 'https://api.autofarm.network/bsc/get_farms_data'
-PANCAKE_PRICE_URL = "https://api.pancakeswap.com/api/v1/price"
+PANCAKE_PRICE_URL = "https://api.pancakeswap.info/api/tokens"
 PANCAKE_ASSUMED_SLIPPAGE = Decimal(0.5 / 100)
 AUTO_WBNB_POOL_ID = 6
 
@@ -41,8 +41,8 @@ def auto_compund(wallet_address, private_key, min_amount_to_harvest):
 
     def get_auto_wbnb_price():
         pancake_swap_price = requests.get(PANCAKE_PRICE_URL).json()
-        auto_price_usd = Decimal(_.get(pancake_swap_price, 'prices.AUTO', 0))
-        wbnb_price_usd = Decimal(_.get(pancake_swap_price, 'prices.WBNB', 0))
+        auto_price_usd = Decimal(_.get(pancake_swap_price, f'data.{AUTO_TOKEN_CONTRACT}.price', 0))
+        wbnb_price_usd = Decimal(_.get(pancake_swap_price, f'data.{WRAP_BNB_TOKEN_CONTRACT}.price', 0))
         return auto_price_usd, wbnb_price_usd
 
     auto_price_usd, wbnb_price_usd = get_auto_wbnb_price()
@@ -75,7 +75,6 @@ def auto_compund(wallet_address, private_key, min_amount_to_harvest):
     connected = w3.isConnected()
 
     if connected:
-        print(f"Checking each pool to see if auto rewards meet the ${min_amount_to_harvest} threshold")
         harvested_auto_amt_gwei = _.reduce(auto_pool_ids, withdraw_auto_token_if_necessary, 0)
         harvested_auto_amt_eth = w3.fromWei(harvested_auto_amt_gwei, 'ether')
         print(f"- Total harvested: Auto {harvested_auto_amt_eth} = ${harvested_auto_amt_eth * auto_price_usd:.2f}")
